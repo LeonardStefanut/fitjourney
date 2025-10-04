@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import { useRouter } from 'next/navigation';
 
+/* -------------------- Tipuri core -------------------- */
 type Food = {
   id: string;
   name: string;
@@ -17,8 +18,53 @@ type MealItem = {
   meal_id: string;
   food_id: string;
   quantity_g: number;
-  foods: Food; // joined row
+  foods: Food;
 };
+
+/* -------------------- Tipuri pentru rândurile din DB (pot avea null-uri) -------------------- */
+type FoodRow = {
+  id: string;
+  name: string;
+  kcal_per_100g: number | null;
+  protein: number | null;
+  carbs: number | null;
+  fat: number | null;
+};
+
+type MealItemRow = {
+  id: string;
+  meal_id: string;
+  food_id: string;
+  quantity_g: number | null;
+  foods: FoodRow | null;
+};
+
+/* -------------------- Mapări sigure DB -> UI -------------------- */
+const mapFoodRow = (r: FoodRow): Food => ({
+  id: r.id,
+  name: r.name ?? '',
+  kcal_per_100g: r.kcal_per_100g ?? 0,
+  protein: r.protein ?? 0,
+  carbs: r.carbs ?? 0,
+  fat: r.fat ?? 0,
+});
+
+const mapMealItemRow = (r: MealItemRow): MealItem => ({
+  id: r.id,
+  meal_id: r.meal_id,
+  food_id: r.food_id,
+  quantity_g: r.quantity_g ?? 0,
+  foods: mapFoodRow(
+    r.foods ?? {
+      id: '',
+      name: '',
+      kcal_per_100g: 0,
+      protein: 0,
+      carbs: 0,
+      fat: 0,
+    }
+  ),
+});
 
 export default function Dashboard() {
   const router = useRouter();
@@ -35,9 +81,9 @@ export default function Dashboard() {
   const [quantity, setQuantity] = useState<number>(100);
   const [err, setErr] = useState<string | null>(null);
 
-  // ---------- AUTH: avoid flicker ----------
+  /* ---------- AUTH: evităm flicker ---------- */
   useEffect(() => {
-    let subscription: { unsubscribe: () => void } | null = null;
+    let unsub: { unsubscribe: () => void } | null = null;
 
     const init = async () => {
       const { data: { session } } = await supabase.auth.getSession();
@@ -46,17 +92,14 @@ export default function Dashboard() {
         setLoadingAuth(false);
         return;
       }
-
-      // listen for hydration
       const { data } = supabase.auth.onAuthStateChange((_evt, newSession) => {
         if (newSession?.user) {
           setUserId(newSession.user.id);
           setLoadingAuth(false);
         }
       });
-      subscription = data.subscription;
+      unsub = data.subscription;
 
-      // only then, after a short delay, send to /login if still no user
       setTimeout(() => {
         if (!session?.user && !userId) {
           setLoadingAuth(false);
@@ -66,32 +109,48 @@ export default function Dashboard() {
     };
 
     init();
-    return () => { subscription?.unsubscribe(); };
+    return () => { unsub?.unsubscribe(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
 
-  // ---------- LOAD FOODS ----------
+  /* ---------- FOODS ---------- */
   useEffect(() => {
     const loadFoods = async () => {
       const { data, error } = await supabase
         .from('foods')
         .select('id, name, kcal_per_100g, protein, carbs, fat')
         .order('name', { ascending: true })
-        .limit(200);
+        .limit(200)
+        .returns<FoodRow[]>(); // <<< tipăm răspunsul
 
-      if (error) setErr(error.message);
-      setFoods((data as unknown as Food[]) || []);
+      if (error) { setErr(error.message); return; }
+      setFoods((data ?? []).map(mapFoodRow));
     };
     loadFoods();
   }, []);
 
-  // ---------- ENSURE TODAY'S MEAL ----------
+  /* ---------- ENSURE PROFILE + TODAY'S MEAL ---------- */
   useEffect(() => {
     if (!userId) return;
 
-    const ensureMeal = async () => {
+    const ensureProfileAndMeal = async () => {
       const today = new Date().toISOString().slice(0, 10);
 
+      // profil (FK pentru meals.user_id)
+      const { data: prof, error: profErr } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('id', userId)
+        .maybeSingle();
+      if (profErr) { setErr(profErr.message); return; }
+      if (!prof?.id) {
+        const { error: upErr } = await supabase
+          .from('profiles')
+          .upsert({ id: userId, name: '' }, { onConflict: 'id' });
+        if (upErr) { setErr(upErr.message); return; }
+      }
+
+      // masa de azi (lunch)
       const { data: existing, error: selErr } = await supabase
         .from('meals')
         .select('id')
@@ -100,9 +159,8 @@ export default function Dashboard() {
         .eq('meal_type', 'lunch')
         .maybeSingle();
 
-      if (selErr) return setErr(selErr.message);
-
-      if (existing?.id) return setMealId(existing.id);
+      if (selErr) { setErr(selErr.message); return; }
+      if (existing?.id) { setMealId(existing.id); return; }
 
       const { data: inserted, error: insErr } = await supabase
         .from('meals')
@@ -110,31 +168,14 @@ export default function Dashboard() {
         .select('id')
         .single();
 
-      if (insErr) return setErr(insErr.message);
+      if (insErr) { setErr(insErr.message); return; }
       setMealId(inserted.id);
     };
 
-    ensureMeal();
+    ensureProfileAndMeal();
   }, [userId]);
 
-  // ---------- ITEMS HELPERS ----------
-  const mapItems = (rows: any[] | null): MealItem[] =>
-    (rows ?? []).map((r: any) => ({
-      id: String(r.id),
-      meal_id: String(r.meal_id),
-      food_id: String(r.food_id),
-      quantity_g: Number(r.quantity_g),
-      foods: {
-        id: String(r.foods?.id),
-        name: String(r.foods?.name),
-        kcal_per_100g: Number(r.foods?.kcal_per_100g ?? 0),
-        protein: Number(r.foods?.protein ?? 0),
-        carbs: Number(r.foods?.carbs ?? 0),
-        fat: Number(r.foods?.fat ?? 0),
-      },
-    }));
-
-  // ---------- LOAD ITEMS FOR CURRENT MEAL ----------
+  /* ---------- ITEMS ---------- */
   useEffect(() => {
     if (!mealId) return;
 
@@ -145,16 +186,17 @@ export default function Dashboard() {
           'id, meal_id, food_id, quantity_g, foods ( id, name, kcal_per_100g, protein, carbs, fat )'
         )
         .eq('meal_id', mealId)
-        .order('id');
+        .order('id')
+        .returns<MealItemRow[]>(); // <<< tipăm răspunsul
 
-      if (error) setErr(error.message);
-      setItems(mapItems(data as any[]));
+      if (error) { setErr(error.message); return; }
+      setItems((data ?? []).map(mapMealItemRow));
     };
 
     loadItems();
   }, [mealId]);
 
-  // ---------- ADD ITEM ----------
+  /* ---------- ADD ITEM ---------- */
   const addItem = async () => {
     setErr(null);
     if (!mealId || !selectedFoodId || quantity <= 0) return;
@@ -163,20 +205,23 @@ export default function Dashboard() {
       .from('meal_items')
       .insert({ meal_id: mealId, food_id: selectedFoodId, quantity_g: quantity });
 
-    if (error) return setErr(error.message);
+    if (error) { setErr(error.message); return; }
 
+    // reload items
     const { data } = await supabase
       .from('meal_items')
       .select(
         'id, meal_id, food_id, quantity_g, foods ( id, name, kcal_per_100g, protein, carbs, fat )'
       )
-      .eq('meal_id', mealId);
+      .eq('meal_id', mealId)
+      .returns<MealItemRow[]>();
 
-    setItems(mapItems(data as any[]));
+    setItems((data ?? []).map(mapMealItemRow));
     setQuantity(100);
     setSelectedFoodId('');
   };
 
+  /* ---------- TOTALS ---------- */
   const totals = useMemo(() => {
     return items.reduce(
       (acc, it) => {
@@ -196,7 +241,7 @@ export default function Dashboard() {
     router.push('/login');
   };
 
-  // ---------- RENDER ----------
+  /* ---------- RENDER ---------- */
   if (loadingAuth) {
     return <p style={{ maxWidth: 720, margin: '2rem auto' }}>Se verifică autentificarea…</p>;
   }
